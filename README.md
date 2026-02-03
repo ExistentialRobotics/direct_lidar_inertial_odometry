@@ -1,3 +1,54 @@
+# Instruction of Setting Up DLIO on Jackal
+
+This repo makes essential modifications to deploy DLIO on Jackal (default: Jackal2) used in [ERL](https://existentialrobotics.org). Here is an example of the deskewed points output by DLIO on Jackal:
+<img src="assets/FAH.png" style="width:30%;"/>
+
+Unless the Jackal robot has its configuration changed, the modification in this repo is correct. So, this repo should be ready to use for Jackal.
+
+Here are the modifications:
+
+## 1. Specify the frame name to publish in `cfg/params.yaml`
+
+```
+dlio:
+
+  frames:
+    odom: odom
+    baselink: dlio/base_link  # name of the base link frame to publish
+    lidar: dlio/os_sensor  # name of the lidar frame to publish
+    imu: dlio/os_imu  # name of the imu frame to publish
+```
+
+## 2. Specify the static transformations from base_link to LiDAR/IMU
+
+The LiDAR frame path should be the one in the point cloud message.
+
+```
+dlio:
+  extrinsics:
+    baselink2imu:  # e.g. rosrun tf tf_echo jackal2/base_link jackal2/os_sensor
+      t: [ -0.126, 0.012, 0.306 ]
+      R: [ -1.,  0.,  0.,
+           0.,  -1.,  0.,
+           0.,  0.,  1. ]
+    baselink2lidar:  # e.g. rosrun tf tf_echo jackal2/base_link jackal2/os_imu
+      t: [ -0.120, 0.0, 0.335 ]
+      R: [ 1.0, 0.0, 0.0,
+           0.0, 1.0, 0.0,
+           0.0, 0.0, 1.0]
+```
+
+## 3. Bridge frames in the TF tree
+
+Two static transformations are added in `launch/dlio.launch` to bridge the frames between DLIO and Jackal:
+
+```
+<!-- Static transform from odom to robot_namespace/odom -->
+<node name="odom_tf_broadcaster" pkg="tf2_ros" type="static_transform_publisher" args="0 0 0 0 0 0 odom $(arg robot_namespace)/odom" />
+<!-- Static transform from robot_namespace/base_link to robot_namespace/dlio/base_link -->
+<node name="base_link_tf_broadcaster" pkg="tf2_ros" type="static_transform_publisher" args="0 0 0 0 0 0 $(arg robot_namespace)/dlio/base_link $(arg robot_namespace)/base_link" />
+```
+
 # Direct LiDAR-Inertial Odometry: Lightweight LIO with Continuous-Time Motion Correction
 
 #### [[ IEEE ICRA ](https://ieeexplore.ieee.org/document/10160508)] [[ arXiv ](https://arxiv.org/abs/2203.03749)] [[ Video ](https://www.youtube.com/watch?v=4-oXjG8ow10)] [[ Presentation ](https://www.youtube.com/watch?v=Hmiw66KZ1tU)]
@@ -12,7 +63,7 @@ DLIO is a new lightweight LiDAR-inertial odometry algorithm with a novel coarse-
 ## Instructions
 
 ### Sensor Setup & Compatibility
-DLIO has been extensively tested using a variety of sensor configurations and currently supports Ouster, Velodyne, Hesai, and Livox LiDARs. The point cloud should be of input type `sensor_msgs::PointCloud2` and the 6-axis IMU input type of `sensor_msgs::Imu`. 
+DLIO has been extensively tested using a variety of sensor configurations and currently supports Ouster, Velodyne, Hesai, and Livox LiDARs. The point cloud should be of input type `sensor_msgs::PointCloud2` and the 6-axis IMU input type of `sensor_msgs::Imu`.
 
 For Livox sensors specifically, you can use the `master` branch directly if it is of type `sensor_msgs::PointCloud2` (`xfer_format: 0`), or the `feature/livox-support` branch and the latest [`livox_ros_driver2`](https://github.com/Livox-SDK/livox_ros_driver2) package if it is of type `livox_ros_driver2::CustomMsg` (`xfer_format: 1`) (see [here](https://github.com/vectr-ucla/direct_lidar_inertial_odometry/issues/5) for more information).
 
@@ -58,7 +109,7 @@ roslaunch direct_lidar_inertial_odometry dlio.launch \
   imu_topic:=/robot/imu
 ```
 
-for Ouster, Velodyne, Hesai, or Livox (`xfer_format: 0`) sensors, or 
+for Ouster, Velodyne, Hesai, or Livox (`xfer_format: 0`) sensors, or
 
 ```sh
 roslaunch direct_lidar_inertial_odometry dlio.launch \

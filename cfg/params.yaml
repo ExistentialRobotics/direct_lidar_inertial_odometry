@@ -14,12 +14,12 @@ dlio:
 
   frames:
     odom: odom
-    baselink: base_link
-    lidar: lidar
-    imu: imu
+    baselink: dlio/base_link  # name of the base link frame to publish
+    lidar: dlio/os_sensor  # name of the lidar frame to publish
+    imu: dlio/os_imu  # name of the imu frame to publish
 
   map:
-    waitUntilMove: true
+    waitUntilMove: false
     dense:
       filtered: false
     sparse:
@@ -35,12 +35,12 @@ dlio:
       calibration:
         gyro: true
         accel: true
-        time: 3
+        time: 3.5
       bufferSize: 5000
 
     preprocessing:
       cropBoxFilter:
-        size: 1.0
+        size: 0.35
       voxelFilter:
         res: 0.25
 
@@ -69,4 +69,4 @@ dlio:
       Kab: 2.25
       Kgb: 1.0
       abias_max: 5.0
-      gbias_max: 0.5
+      gbias_max: 2.5

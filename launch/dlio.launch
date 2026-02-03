@@ -1,6 +1,6 @@
 <!--
 
-  Copyright (c)     
+  Copyright (c)
 
   The Verifiable & Control-Theoretic Robotics (VECTR) Lab
   University of California, Los Angeles
@@ -12,17 +12,22 @@
 
 <launch>
 
-  <arg name="robot_namespace" default="robot"/>
+  <arg name="robot_namespace" default="jackal2"/>
   <arg name="rviz" default="false"/>
 
-  <arg name="pointcloud_topic" default="lidar"/>
-  <arg name="imu_topic" default="imu"/>
+  <arg name="pointcloud_topic" default="/$(arg robot_namespace)/ouster/points"/>
+  <arg name="imu_topic" default="/$(arg robot_namespace)/ouster/imu"/>
+
+  <!-- Static transform from odom to robot_namespace/odom -->
+  <node name="odom_tf_broadcaster" pkg="tf2_ros" type="static_transform_publisher" args="0 0 0 0 0 0 odom $(arg robot_namespace)/odom" />
+  <!-- Static transform from robot_namespace/base_link to robot_namespace/dlio/base_link -->
+  <node name="base_link_tf_broadcaster" pkg="tf2_ros" type="static_transform_publisher" args="0 0 0 0 0 0 $(arg robot_namespace)/dlio/base_link $(arg robot_namespace)/base_link" />
 
   <!-- DLIO Odometry Node -->
   <node ns="$(arg robot_namespace)" name="dlio_odom" pkg="direct_lidar_inertial_odometry" type="dlio_odom_node" output="screen" clear_params="true">
 
     <!-- Load parameters -->
-    <rosparam file="$(find direct_lidar_inertial_odometry)/cfg/dlio.yaml" command="load"/>
+    <rosparam file="$(find direct_lidar_inertial_odometry)/cfg/dlio_$(arg robot_namespace).yaml" command="load"/>
     <rosparam file="$(find direct_lidar_inertial_odometry)/cfg/params.yaml" command="load"/>
 
     <!-- Subscriptions -->
@@ -43,7 +48,7 @@
   <node ns="$(arg robot_namespace)" name="dlio_map" pkg="direct_lidar_inertial_odometry" type="dlio_map_node" output="screen" clear_params="true">
 
     <!-- Load parameters -->
-    <rosparam file="$(find direct_lidar_inertial_odometry)/cfg/dlio.yaml" command="load"/>
+    <rosparam file="$(find direct_lidar_inertial_odometry)/cfg/dlio_$(arg robot_namespace).yaml" command="load"/>
     <rosparam file="$(find direct_lidar_inertial_odometry)/cfg/params.yaml" command="load"/>
 
     <!-- Subscriptions -->
