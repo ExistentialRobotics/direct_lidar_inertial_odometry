@@ -1,7 +1,10 @@
 # Instruction of Setting Up DLIO on Jackal
 
 This repo makes essential modifications to deploy DLIO on Jackal (default: Jackal2) used in [ERL](https://existentialrobotics.org). Here is an example of the deskewed points output by DLIO on Jackal:
+
+<br />
 <img src="assets/FAH.png" style="width:30%;"/>
+<br />
 
 Unless the Jackal robot has its configuration changed, the modification in this repo is correct. So, this repo should be ready to use for Jackal.
 
