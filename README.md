@@ -6,6 +6,9 @@ This repo makes essential modifications to deploy DLIO on Jackal (default: Jacka
 <img src="assets/FAH.png" style="width:30%;"/>
 <br />
 
+The advantage of DLIO is to get deskewed points in real-time, which can be used to improve mapping and localization performance.
+The deskewed points are published on the topic `/jackal2/dlio/odom_node/pointcloud/deskewed`.
+
 Unless the Jackal robot has its configuration changed, the modification in this repo is correct. So, this repo should be ready to use for Jackal.
 
 Here are the modifications:
