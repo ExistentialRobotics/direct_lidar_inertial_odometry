@@ -17,6 +17,7 @@ dlio:
     baselink: dlio/base_link  # name of the base link frame to publish
     lidar: dlio/os_sensor  # name of the lidar frame to publish
     imu: dlio/os_imu  # name of the imu frame to publish
+    publishDeskewedInLidarFrame: true # whether to publish the deskewed point cloud in the lidar frame (true) or odom frame (false)
 
   map:
     waitUntilMove: false

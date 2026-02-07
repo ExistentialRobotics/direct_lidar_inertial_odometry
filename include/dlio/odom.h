@@ -139,6 +139,7 @@ private:
   std::string baselink_frame;
   std::string lidar_frame;
   std::string imu_frame;
+  bool publish_deskewed_in_lidar_frame = true;
 
   // Preprocessing
   pcl::CropBox<PointType> crop;

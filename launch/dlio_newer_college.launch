@@ -1,0 +1,79 @@
+<!--
+
+  Copyright (c)
+
+  The Verifiable & Control-Theoretic Robotics (VECTR) Lab
+  University of California, Los Angeles
+
+  Authors: Kenny J. Chen, Ryan Nemiroff, Brett T. Lopez
+  Contact: {kennyjchen, ryguyn, btlopez}@ucla.edu
+
+-->
+
+<launch>
+
+  <arg name="robot_namespace" default="robot"/>
+  <arg name="rviz" default="false"/>
+  <arg name="input_bag_file" default="/home/daizhirui/Data/NewerCollege/2021-07-01-10-37-38-quad-easy.bag"/>
+  <arg name="playback_rate" default="0.5"/>
+  <arg name="output_bag_file" default="/home/daizhirui/Data/NewerCollege/dlio_newer_college_recording.bag"/>
+  <arg name="record_bag" default="false"/>
+
+  <arg name="pointcloud_topic" default="/os_cloud_node/points"/>
+  <arg name="imu_topic" default="/os_cloud_node/imu"/>
+
+  <!-- Static transform from odom to robot_namespace/odom -->
+  <!-- <node name="odom_tf_broadcaster" pkg="tf2_ros" type="static_transform_publisher" args="0 0 0 0 0 0 odom /odom" /> -->
+  <!-- Static transform from robot_namespace/base_link to robot_namespace/dlio/base_link -->
+  <node name="base_link_tf_broadcaster" pkg="tf2_ros" type="static_transform_publisher" args="0 0 0 0 0 0 $(arg robot_namespace)/dlio/os_sensor os_sensor" />
+
+  <param name="/use_sim_time" value="true"/>
+
+  <!-- auto exit if record_bag is true -->
+  <node name="player" pkg="rosbag" type="play" output="screen" args="--clock -r $(arg playback_rate) $(arg input_bag_file)" required="$(arg record_bag)"/>
+
+  <!-- DLIO Odometry Node -->
+  <node ns="$(arg robot_namespace)" name="dlio_odom" pkg="direct_lidar_inertial_odometry" type="dlio_odom_node" output="screen" clear_params="true"
+  >
+
+    <!-- Load parameters -->
+    <rosparam file="$(find direct_lidar_inertial_odometry)/cfg/dlio_newer_college.yaml" command="load"/>
+    <rosparam file="$(find direct_lidar_inertial_odometry)/cfg/params.yaml" command="load"/>
+
+    <!-- Subscriptions -->
+    <remap from="~pointcloud" to="$(arg pointcloud_topic)"/>
+    <remap from="~imu" to="$(arg imu_topic)"/>
+
+    <!-- Publications -->
+    <remap from="~odom"     to="dlio/odom_node/odom"/>
+    <remap from="~pose"     to="dlio/odom_node/pose"/>
+    <remap from="~path"     to="dlio/odom_node/path"/>
+    <remap from="~kf_pose"  to="dlio/odom_node/keyframes"/>
+    <remap from="~kf_cloud" to="dlio/odom_node/pointcloud/keyframe"/>
+    <remap from="~deskewed" to="dlio/odom_node/pointcloud/deskewed"/>
+
+  </node>
+
+  <!-- DLIO Mapping Node -->
+  <node ns="$(arg robot_namespace)" name="dlio_map" pkg="direct_lidar_inertial_odometry" type="dlio_map_node" output="screen" clear_params="true">
+
+    <!-- Load parameters -->
+    <rosparam file="$(find direct_lidar_inertial_odometry)/cfg/dlio_newer_college.yaml" command="load"/>
+    <rosparam file="$(find direct_lidar_inertial_odometry)/cfg/params.yaml" command="load"/>
+
+    <!-- Subscriptions -->
+    <remap from="~keyframes" to="dlio/odom_node/pointcloud/keyframe"/>
+
+    <!-- Publications -->
+    <remap from="~map" to="dlio/map_node/map"/>
+
+  </node>
+
+  <!-- RViz -->
+  <node pkg="rviz" type="rviz" name="dlio_rviz" args="-d $(find direct_lidar_inertial_odometry)/launch/newer_college.rviz" if="$(arg rviz)"/>
+
+  <!-- rosbag recorder -->
+  <node pkg="rosbag" type="record" name="dlio_bag_recorder"
+    args="-O $(arg output_bag_file) /$(arg robot_namespace)/dlio/odom_node/odom /$(arg robot_namespace)/dlio/odom_node/pose /$(arg robot_namespace)/dlio/odom_node/path /$(arg robot_namespace)/dlio/odom_node/keyframes /$(arg robot_namespace)/dlio/odom_node/pointcloud/keyframe /$(arg robot_namespace)/dlio/odom_node/pointcloud/deskewed /$(arg robot_namespace)/dlio/map_node/map /tf /tf_static" if="$(arg record_bag)"/>
+
+</launch>
