@@ -10,6 +10,8 @@
  *                                                         *
  ***********************************************************/
 
+#pragma once
+
 #include "dlio/dlio.h"
 
 // ROS
@@ -370,7 +372,7 @@ private:
     int numProcessors;
 
     // Parameters
-    bool terminal_output_;
+    bool verbose_;
     std::string version_;
     int num_threads_;
 

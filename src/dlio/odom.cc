@@ -19,9 +19,8 @@
 
 dlio::OdomNode::OdomNode()
     : Node("dlio_odom_node") {
-    this->getParams();
 
-    this->num_threads_ = omp_get_max_threads();
+    this->getParams();
 
     this->dlio_initialized = false;
     this->first_valid_scan = false;
@@ -34,6 +33,7 @@ dlio::OdomNode::OdomNode()
     this->deskew_status = false;
     this->deskew_size = 0;
 
+    // Subscribers
     this->lidar_cb_group =
         this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     auto lidar_sub_opt = rclcpp::SubscriptionOptions();
@@ -192,8 +192,11 @@ dlio::OdomNode::getParams() {
     // Version
     dlio::declare_param(this, "version", this->version_, "0.0.0");
 
-    // Debug
-    dlio::declare_param(this, "terminal_output", this->terminal_output_, true);
+    // Verbosity
+    dlio::declare_param(this, "verbose", this->verbose_, true);
+
+    // Number of threads to run with
+    dlio::declare_param(this, "num_threads", this->num_threads_, omp_get_max_threads());
 
     // Frames
     dlio::declare_param(this, "frames.odom", this->odom_frame, "odom");
@@ -345,14 +348,17 @@ dlio::OdomNode::getParams() {
 
 void
 dlio::OdomNode::start() {
-    printf("\033[2J\033[1;1H");
-    std::cout << std::endl
-              << "+-------------------------------------------------------------------+"
-              << std::endl;
-    std::cout << "|               Direct LiDAR-Inertial Odometry v" << this->version_
-              << "               |" << std::endl;
-    std::cout << "+-------------------------------------------------------------------+"
-              << std::endl;
+
+    if (this->verbose_) {
+        printf("\033[2J\033[1;1H");
+        std::cout << std::endl
+                  << "+-------------------------------------------------------------------+"
+                  << std::endl;
+        std::cout << "|               Direct LiDAR-Inertial Odometry v" << this->version_
+                  << "               |" << std::endl;
+        std::cout << "+-------------------------------------------------------------------+"
+                  << std::endl;
+    }
 }
 
 void
@@ -479,6 +485,7 @@ dlio::OdomNode::publishCloud(
     pcl::PointCloud<PointType>::ConstPtr published_cloud,
     Eigen::Matrix4f T_cloud) {
     if (this->wait_until_move_) {
+        // wait until the robot is moving to publish dense map
         if (this->length_traversed < 0.1) { return; }
     }
 
@@ -803,6 +810,7 @@ dlio::OdomNode::deskewPointcloud() {
 
 #pragma omp parallel for num_threads(this->num_threads_)
     for (int i = 0; i < timestamps.size(); i++) {
+
         Eigen::Matrix4f T = frames[i] * this->extrinsics.baselink2lidar_T;
 
         // transform point to world frame
@@ -901,8 +909,7 @@ dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::SharedPt
     // Update current keyframe poses and map
     this->updateKeyframes();
 
-    // Build keyframe normals and submap if needed (and if we're not already
-    // waiting)
+    // Build keyframe normals and submap if needed (and if we're not already waiting)
     if (this->new_submap_is_ready) {
         this->main_loop_running = false;
         this->submap_future = std::async(
@@ -1058,8 +1065,8 @@ dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw) {
 
     } else {
         double dt = imu_stamp_secs - this->prev_imu_stamp;
-        if (dt == 0) { dt = 1.0 / 200.0; }
         this->imu_rates.push_back(1. / dt);
+        if (dt == 0) { return; }
 
         // Apply the calibrated bias to the new IMU measurements
         this->imu_meas.stamp = imu_stamp_secs;
@@ -2000,7 +2007,7 @@ dlio::OdomNode::debug() {
         this->cpu_percents.size();
 
     // Print to terminal
-    if (!this->terminal_output_) return;
+    if (!this->verbose_) return;
     printf("\033[2J\033[1;1H");
 
     std::cout << std::endl
