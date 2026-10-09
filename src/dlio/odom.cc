@@ -1838,13 +1838,14 @@ dlio::OdomNode::buildSubmap(State vehicle_state) {
             // create current submap cloud
             lock.lock();
             *submap_cloud_ += *this->keyframes[k].second;
+            std::shared_ptr<const nano_gicp::CovarianceList> normals = this->keyframe_normals[k];
             lock.unlock();
 
             // grab corresponding submap cloud's normals
             submap_normals_->insert(
                 std::end(*submap_normals_),
-                std::begin(*(this->keyframe_normals[k])),
-                std::end(*(this->keyframe_normals[k])));
+                std::begin(*normals),
+                std::end(*normals));
         }
 
         this->submap_cloud = submap_cloud_;
@@ -1884,7 +1885,7 @@ dlio::OdomNode::buildKeyframesAndSubmap(State vehicle_state) {
             raw_covariances->begin(),
             raw_covariances->end(),
             transformed_covariances->begin(),
-            [&Td](Eigen::Matrix4d cov) { return Td * cov * Td.transpose(); });
+            [&Td](const Eigen::Matrix4d &cov) -> Eigen::Matrix4d { return Td * cov * Td.transpose(); });
 
         ++this->num_processed_keyframes;
 
