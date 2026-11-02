@@ -15,7 +15,13 @@
 #include "dlio/utils.h"
 #include "rclcpp/qos.hpp"
 
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <limits>
 #include <queue>
+#include <stdexcept>
 
 dlio::OdomNode::OdomNode()
     : Node("dlio_odom_node") {
@@ -36,13 +42,21 @@ dlio::OdomNode::OdomNode()
     // Subscribers
     this->lidar_cb_group =
         this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-    auto lidar_sub_opt = rclcpp::SubscriptionOptions();
-    lidar_sub_opt.callback_group = this->lidar_cb_group;
-    this->lidar_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-        "pointcloud",
-        1,
-        std::bind(&dlio::OdomNode::callbackPointCloud, this, std::placeholders::_1),
-        lidar_sub_opt);
+    if (this->pointcloud_qos_ == "auto") {
+        // reliable when every publisher offers it (Gazebo's bridge, the self filter), else best effort (the Ouster's
+        // driver): a best effort reader loses a 2 MB cloud whenever one of its fragments is lost
+        this->qos_timer = this->create_wall_timer(std::chrono::milliseconds(200), [this] {
+            const auto pubs = this->get_publishers_info_by_topic(
+                this->get_node_topics_interface()->resolve_topic_name("pointcloud"));
+            if (pubs.empty()) { return; }
+            this->qos_timer->cancel();
+            this->subscribePointCloud(std::all_of(pubs.begin(), pubs.end(), [](const auto &p) {
+                return p.qos_profile().reliability() == rclcpp::ReliabilityPolicy::Reliable;
+            }));
+        });
+    } else {
+        this->subscribePointCloud(this->pointcloud_qos_ != "best_effort");
+    }
 
     this->imu_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     auto imu_sub_opt = rclcpp::SubscriptionOptions();
@@ -59,6 +73,9 @@ dlio::OdomNode::OdomNode()
     this->kf_pose_pub = this->create_publisher<geometry_msgs::msg::PoseArray>("kf_pose", 1);
     this->kf_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("kf_cloud", 1);
     this->deskewed_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("deskewed", 1);
+    // (reliable reaches both kinds of subscriber)
+    this->organized_pub =
+        this->create_publisher<sensor_msgs::msg::PointCloud2>("organized", rclcpp::QoS(2).reliable());
 
     this->br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
 
@@ -188,6 +205,22 @@ dlio::OdomNode::OdomNode()
 dlio::OdomNode::~OdomNode() {}
 
 void
+dlio::OdomNode::subscribePointCloud(bool reliable) {
+    auto lidar_sub_opt = rclcpp::SubscriptionOptions();
+    lidar_sub_opt.callback_group = this->lidar_cb_group;
+    this->lidar_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+        "pointcloud",
+        reliable ? rclcpp::QoS(1).reliable() : rclcpp::QoS(1).best_effort(),
+        std::bind(&dlio::OdomNode::callbackPointCloud, this, std::placeholders::_1),
+        lidar_sub_opt);
+    RCLCPP_INFO(
+        this->get_logger(),
+        "%s: subscribed %s",
+        this->lidar_sub->get_topic_name(),
+        reliable ? "reliably" : "best effort");
+}
+
+void
 dlio::OdomNode::getParams() {
     // Version
     dlio::declare_param(this, "version", this->version_, "0.0.0");
@@ -211,6 +244,28 @@ dlio::OdomNode::getParams() {
 
     // Deskew Flag
     dlio::declare_param(this, "pointcloud.deskew", this->deskew_, true);
+
+    // The cloud's subscription: auto (reliable when every publisher offers it), reliable or best_effort
+    dlio::declare_param(this, "pointcloud.qos", this->pointcloud_qos_, std::string("reliable"));
+    if (this->pointcloud_qos_ != "auto" && this->pointcloud_qos_ != "reliable" &&
+        this->pointcloud_qos_ != "best_effort") {
+        throw std::invalid_argument("pointcloud.qos: auto, reliable or best_effort");
+    }
+
+    // The robot's own returns (boxes in the base link frame, six numbers each: x_min, y_min, z_min, x_max, y_max,
+    // z_max): set to NaN before anything else, for DLIO and for the organized cloud
+    dlio::declare_param(
+        this,
+        "pointcloud.selfFilter.boxes",
+        this->self_boxes_,
+        std::vector<double>{});
+    if (this->self_boxes_.size() % 6 != 0) {
+        throw std::invalid_argument("pointcloud.selfFilter.boxes: six numbers a box");
+    }
+
+    // The organized cloud: the input as it came (organized, every field kept, the self filter's NaNs), each return
+    // deskewed with the IMU's poses to the sweep's middle, on ~/organized
+    dlio::declare_param(this, "pointcloud.organized", this->organized_use_, false);
 
     // Gravity
     dlio::declare_param(this, "odom.gravity", this->gravity_, 9.80665);
@@ -572,6 +627,111 @@ dlio::OdomNode::publishKeyframe(
 }
 
 void
+dlio::OdomNode::maskSelf(sensor_msgs::msg::PointCloud2 &pc) {
+    // The points inside a box (base link frame) set to NaN in place
+    int off[3] = {-1, -1, -1};
+    for (const auto &f: pc.fields) {
+        const int c = f.name == "x" ? 0 : f.name == "y" ? 1 : f.name == "z" ? 2 : -1;
+        if (c >= 0 && f.datatype == sensor_msgs::msg::PointField::FLOAT32) { off[c] = f.offset; }
+    }
+    if (off[0] < 0 || off[1] < 0 || off[2] < 0 || pc.is_bigendian) {
+        RCLCPP_ERROR_ONCE(this->get_logger(), "self filter: the cloud needs little-endian float32 x, y, z");
+        return;
+    }
+    const Eigen::Matrix4f &T = this->extrinsics.baselink2lidar_T;  // base link <- lidar
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    size_t masked = 0;
+    for (uint32_t r = 0; r < pc.height; r++) {
+        for (uint32_t c = 0; c < pc.width; c++) {
+            uint8_t *p = pc.data.data() + r * pc.row_step + c * pc.point_step;
+            float v[3];
+            for (int k = 0; k < 3; k++) { std::memcpy(&v[k], p + off[k], sizeof(float)); }
+            if (!std::isfinite(v[0]) || !std::isfinite(v[1]) || !std::isfinite(v[2])) { continue; }
+            const Eigen::Vector4f q = T * Eigen::Vector4f(v[0], v[1], v[2], 1.f);
+            for (size_t b = 0; b + 6 <= this->self_boxes_.size(); b += 6) {
+                const double *x = &this->self_boxes_[b];
+                if (q[0] >= x[0] && q[1] >= x[1] && q[2] >= x[2] && q[0] <= x[3] && q[1] <= x[4] && q[2] <= x[5]) {
+                    for (int k = 0; k < 3; k++) { std::memcpy(p + off[k], &nan, sizeof(float)); }
+                    masked++;
+                    break;
+                }
+            }
+        }
+    }
+    pc.is_dense = false;
+    RCLCPP_INFO_ONCE(
+        this->get_logger(),
+        "self filter: %zu box(es) in the base link frame, %zu returns masked in the first cloud",
+        this->self_boxes_.size() / 6,
+        masked);
+}
+
+void
+dlio::OdomNode::publishOrganized(const sensor_msgs::msg::PointCloud2 &pc) {
+    // The cloud as it came (organized, every field kept), each return moved to where it would be had the whole sweep
+    // been taken at DLIO's scan time (its median return's, mid-sweep), with the poses deskewPointcloud() integrated
+    // from the IMU for this sweep (its own deskew's: no second integration). Stamped at that time with t zeroed, so
+    // a consumer places it whole with the pose at its stamp. Without a deskew (no per-point times, no IMU prior yet, a
+    // bad sync) it goes out as it came, t kept, and the consumers deskew it themselves.
+    const auto start = std::chrono::steady_clock::now();
+    auto out = std::make_shared<sensor_msgs::msg::PointCloud2>(pc);
+    int off[3] = {-1, -1, -1}, toff = -1;
+    for (const auto &f: out->fields) {
+        const int c = f.name == "x" ? 0 : f.name == "y" ? 1 : f.name == "z" ? 2 : -1;
+        if (c >= 0 && f.datatype == sensor_msgs::msg::PointField::FLOAT32) { off[c] = f.offset; }
+        if (f.name == "t" && f.datatype == sensor_msgs::msg::PointField::UINT32) { toff = f.offset; }
+    }
+    const bool layout = off[0] >= 0 && off[1] >= 0 && off[2] >= 0 && !out->is_bigendian;
+    const std::vector<double> &times = this->deskew_times_;
+    if (layout && toff >= 0 && this->deskew_status && !this->deskew_frames_.empty()) {
+        // each of the sweep's times to the scan time's lidar frame
+        const Eigen::Matrix4f &B2L = this->extrinsics.baselink2lidar_T;
+        const Eigen::Matrix4f to_ref = (this->deskew_frames_[this->deskew_median_] * B2L).inverse();
+        std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> M(times.size());
+        for (size_t i = 0; i < times.size(); i++) { M[i] = to_ref * this->deskew_frames_[i] * B2L; }
+        const double sweep_ref = rclcpp::Time(out->header.stamp).seconds() + this->deskew_offset_;
+        const uint32_t zero = 0;
+        for (uint32_t r = 0; r < out->height; r++) {
+            for (uint32_t c = 0; c < out->width; c++) {
+                uint8_t *p = out->data.data() + r * out->row_step + c * out->point_step;
+                float v[3];
+                for (int k = 0; k < 3; k++) { std::memcpy(&v[k], p + off[k], sizeof(float)); }
+                if (std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2])) {
+                    uint32_t t;
+                    std::memcpy(&t, p + toff, sizeof t);
+                    // (the nearest of the deskew's times: a return DLIO cropped has no time of its own there)
+                    const double tp = sweep_ref + t * 1e-9;
+                    size_t i = std::lower_bound(times.begin(), times.end(), tp) - times.begin();
+                    if (i == times.size() || (i > 0 && tp - times[i - 1] < times[i] - tp)) { i--; }
+                    const Eigen::Vector4f q = M[i] * Eigen::Vector4f(v[0], v[1], v[2], 1.f);
+                    for (int k = 0; k < 3; k++) { std::memcpy(p + off[k], &q[k], sizeof(float)); }
+                }
+                std::memcpy(p + toff, &zero, sizeof zero);
+            }
+        }
+        out->header.stamp =
+            rclcpp::Time(static_cast<int64_t>(std::llround(times[this->deskew_median_] * 1e9)), RCL_ROS_TIME);
+        RCLCPP_INFO_ONCE(
+            this->get_logger(),
+            "organized cloud: deskewed to DLIO's scan time (%.0f ms into the sweep), t zeroed",
+            1e3 * (times[this->deskew_median_] - sweep_ref));
+    }
+    const auto t_pub = std::chrono::steady_clock::now();
+    this->organized_pub->publish(*out);
+    this->organized_pub_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pub).count();
+    this->organized_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    this->organized_n_++;
+    RCLCPP_INFO_THROTTLE(
+        this->get_logger(),
+        *this->get_clock(),
+        60000,
+        "organized cloud: %.2f ms a cloud (publishing %.2f; mean over %zu)",
+        this->organized_ms_ / this->organized_n_,
+        this->organized_pub_ms_ / this->organized_n_,
+        this->organized_n_);
+}
+
+void
 dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedPtr &pc) {
     pcl::PointCloud<PointType>::Ptr original_scan_ = std::make_shared<pcl::PointCloud<PointType>>();
     pcl::fromROSMsg(*pc, *original_scan_);
@@ -670,6 +830,7 @@ dlio::OdomNode::preprocessPoints() {
 
 void
 dlio::OdomNode::deskewPointcloud() {
+    this->deskew_frames_.clear();  // (the organized cloud's: none until this sweep's integration succeeds)
     pcl::PointCloud<PointType>::Ptr deskewed_scan_ =
         std::make_shared<pcl::PointCloud<PointType>>(1, this->original_scan->points.size());
     // deskewed_scan_->points.resize(this->original_scan->points.size());
@@ -823,6 +984,10 @@ dlio::OdomNode::deskewPointcloud() {
 
     this->deskewed_scan = deskewed_scan_;
     this->deskew_status = true;
+    this->deskew_times_ = std::move(timestamps);
+    this->deskew_frames_ = std::move(frames);
+    this->deskew_median_ = median_pt_index;
+    this->deskew_offset_ = offset;
 }
 
 void
@@ -853,12 +1018,19 @@ dlio::OdomNode::initializeDLIO() {
 }
 
 void
-dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr pc) {
+dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr pc_in) {
     std::unique_lock<decltype(this->main_loop_running_mutex)> lock(main_loop_running_mutex);
     this->main_loop_running = true;
     lock.unlock();
 
     double then = this->now().seconds();
+
+    // The robot's own returns out (NaN, the layout kept), for DLIO and the organized cloud
+    sensor_msgs::msg::PointCloud2::SharedPtr pc = pc_in;
+    if (!this->self_boxes_.empty()) {
+        pc = std::make_shared<sensor_msgs::msg::PointCloud2>(*pc_in);
+        this->maskSelf(*pc);
+    }
 
     if (this->first_scan_stamp == 0.) {
         this->first_scan_stamp = rclcpp::Time(pc->header.stamp).seconds();
@@ -872,6 +1044,10 @@ dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::SharedPt
 
     // Preprocess points
     this->preprocessPoints();
+
+    // The organized cloud, deskewed as DLIO's own scan (before the registration: the deskew needs only the motion
+    // within the sweep)
+    if (this->organized_use_) { this->publishOrganized(*pc); }
 
     if (!this->first_valid_scan) { return; }
 
@@ -1415,6 +1591,11 @@ dlio::OdomNode::propagateState() {
 
     this->state.v.ang.b = this->imu_meas.ang_vel;
     this->state.v.ang.w = this->state.q.toRotationMatrix() * this->state.v.ang.b;
+
+    auto &h = this->geo.history;  // (updateState prunes it; as many as the IMU buffer at most)
+    h.push_back({this->imu_meas.stamp, this->state.p[0], this->state.p[1], this->state.p[2],
+                 this->state.q.w(), this->state.q.x(), this->state.q.y(), this->state.q.z()});
+    while (h.size() > static_cast<size_t>(std::max(this->imu_buffer_size_, 2))) { h.pop_front(); }
 }
 
 void
@@ -1429,21 +1610,49 @@ dlio::OdomNode::updateState() {
     Eigen::Quaternionf qe, qhat, qcorr;
     qhat = this->state.q;
 
-    // Constuct error quaternion
-    qe = qhat.conjugate() * qin;
+    // The scan's pose is the robot's at the scan's time; the state has been propagated by the IMU
+    // to the latest IMU time. The scan is compared with the state at the scan's time (the
+    // propagation's history) and the correction applied to the state now and to the history after
+    // the scan alike. Compared with the state now, the state settled the update's delay behind
+    // the robot (~80 ms in Gazebo, ~55 ms on a Jetson), and a cloud stamped at its scan time was
+    // placed with a pose that old. With no history around the scan's time: the state now.
+    Eigen::Vector3f p_ref = this->state.p;
+    Eigen::Quaternionf q_ref = this->state.q;
+    auto &h = this->geo.history;
+    const bool delayed =
+        h.size() >= 2 && this->scan_stamp >= h.front()[0] && this->scan_stamp <= h.back()[0];
+    if (delayed) {
+        size_t k = h.size() - 1;  // (from the back: h[k - 1] < scan_stamp <= h[k])
+        while (k > 1 && h[k - 1][0] >= this->scan_stamp) { k--; }
+        const auto &a = h[k - 1], &b = h[k];
+        const double span = b[0] - a[0];
+        const float u = span > 0 ? static_cast<float>((this->scan_stamp - a[0]) / span) : 0.f;
+        p_ref = (1.f - u) * Eigen::Vector3f(a[1], a[2], a[3]) +
+                u * Eigen::Vector3f(b[1], b[2], b[3]);
+        q_ref = Eigen::Quaternionf(a[4], a[5], a[6], a[7])
+                    .slerp(u, Eigen::Quaternionf(b[4], b[5], b[6], b[7]));
+        q_ref.normalize();
+        h.erase(h.begin(), h.begin() + (k - 1));  // (never read again: the next scan is later)
+    }
+
+    // Constuct error quaternion (the scan's body frame; carried into the body frame now for the
+    // correction)
+    qe = q_ref.conjugate() * qin;
+    const Eigen::Quaternionf d = q_ref.conjugate() * qhat;
+    const Eigen::Quaternionf qe_now = d.conjugate() * qe * d;
 
     double sgn = 1.;
-    if (qe.w() < 0) { sgn = -1; }
+    if (qe_now.w() < 0) { sgn = -1; }
 
     // Construct quaternion correction
-    qcorr.w() = 1 - abs(qe.w());
-    qcorr.vec() = sgn * qe.vec();
+    qcorr.w() = 1 - abs(qe_now.w());
+    qcorr.vec() = sgn * qe_now.vec();
     qcorr = qhat * qcorr;
 
-    Eigen::Vector3f err = pin - this->state.p;
+    Eigen::Vector3f err = pin - p_ref;
     Eigen::Vector3f err_body;
 
-    err_body = qhat.conjugate()._transformVector(err);
+    err_body = q_ref.conjugate()._transformVector(err);
 
     double abias_max = this->geo_abias_max_;
     double gbias_max = this->geo_gbias_max_;
@@ -1467,6 +1676,18 @@ dlio::OdomNode::updateState() {
     this->state.q.y() += dt * this->geo_Kq_ * qcorr.y();
     this->state.q.z() += dt * this->geo_Kq_ * qcorr.z();
     this->state.q.normalize();
+
+    // the history after the scan corrected alike: an update later than the next scan (DLIO behind
+    // the lidar) compares that scan with the corrected state, not one short of this correction
+    if (delayed) {
+        const Eigen::Vector3f dp = dt * this->geo_Kp_ * err;
+        const Eigen::Quaternionf dq = qhat.conjugate() * this->state.q;  // (in the body frame)
+        for (auto &e: h) {
+            Eigen::Quaternionf q(e[4], e[5], e[6], e[7]);
+            q = (q * dq).normalized();
+            e = {e[0], e[1] + dp[0], e[2] + dp[1], e[3] + dp[2], q.w(), q.x(), q.y(), q.z()};
+        }
+    }
 
     // store previous pose, orientation, and velocity
     this->geo.prev_p = this->state.p;

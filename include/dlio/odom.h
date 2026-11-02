@@ -14,6 +14,9 @@
 
 #include "dlio/dlio.h"
 
+#include <array>
+#include <deque>
+
 // ROS
 #include "rclcpp/rclcpp.hpp"
 
@@ -60,7 +63,13 @@ private:
     getParams();
 
     void
-    callbackPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr pc);
+    callbackPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr pc_in);
+    void
+    subscribePointCloud(bool reliable);
+    void
+    maskSelf(sensor_msgs::msg::PointCloud2 &pc);
+    void
+    publishOrganized(const sensor_msgs::msg::PointCloud2 &pc);
     void
     callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu);
 
@@ -157,6 +166,7 @@ private:
     debug();
 
     rclcpp::TimerBase::SharedPtr publish_timer;
+    rclcpp::TimerBase::SharedPtr qos_timer;
 
     // Subscribers
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr lidar_sub;
@@ -170,6 +180,7 @@ private:
     rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr kf_pose_pub;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr kf_cloud_pub;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr deskewed_pub;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr organized_pub;
 
     // TF
     std::shared_ptr<tf2_ros::TransformBroadcaster> br;
@@ -321,6 +332,9 @@ private:
         Eigen::Vector3f prev_p;
         Eigen::Quaternionf prev_q;
         Eigen::Vector3f prev_vel;
+        // the state as propagated at each IMU time (stamp, p xyz, q wxyz): updateState compares
+        // the scan's pose with the state at the scan's time
+        std::deque<std::array<double, 8>> history;
     };
 
     Geo geo;
@@ -399,6 +413,18 @@ private:
     bool densemap_filtered_;
     bool wait_until_move_;
     bool publish_deskewed_in_lidar_frame_;
+
+    // the cloud as it came (organized, every field), the robot's own returns out, each return deskewed
+    bool organized_use_;
+    std::vector<double> self_boxes_;  // base link: x_min, y_min, z_min, x_max, y_max, z_max each
+    std::string pointcloud_qos_;      // auto, reliable or best_effort
+    double organized_ms_ = 0., organized_pub_ms_ = 0.;  // its cost, summed (all, publishing)
+    size_t organized_n_ = 0;
+    // the last deskew's times and poses (base link, odom frame), its median's index and time offset: the organized cloud's
+    std::vector<double> deskew_times_;
+    std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> deskew_frames_;
+    size_t deskew_median_ = 0;
+    double deskew_offset_ = 0.;
 
     double crop_size_;
 
