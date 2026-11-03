@@ -73,6 +73,10 @@ private:
     void
     publishPose();
 
+    // The newest state and the time it is at, read together (see the definition).
+    rclcpp::Time
+    stampedState(State& out);
+
     void
     publishToROS(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud);
     void
@@ -304,6 +308,8 @@ private:
 
     // IMU
     rclcpp::Time imu_stamp;
+    // The time the state is at: its last propagation's IMU stamp, zero before the first. Both under geo.mtx.
+    rclcpp::Time state_stamp;
     double first_imu_stamp;
     double prev_imu_stamp;
     double imu_dp, imu_dq_deg;
