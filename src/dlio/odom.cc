@@ -107,6 +107,7 @@ dlio::OdomNode::OdomNode()
     this->imu_meas.lin_accel[2] = 0.;
 
     this->imu_buffer.set_capacity(this->imu_buffer_size_);
+    this->state_history.set_capacity(this->imu_buffer_size_);
     this->first_imu_stamp = 0.;
     this->prev_imu_stamp = 0.;
 
@@ -1639,6 +1640,8 @@ dlio::OdomNode::propagateState() {
     this->state.v.ang.w = this->state.q.toRotationMatrix() * this->state.v.ang.b;
 
     if (this->planar_) { this->stateToPlane(); }
+
+    this->state_history.push_front({this->imu_meas.stamp, this->state});
 }
 
 void
@@ -1650,24 +1653,40 @@ dlio::OdomNode::updateState() {
     Eigen::Quaternionf qin = this->lidarPose.q;
     double dt = this->scan_stamp - this->prev_scan_stamp;
 
-    Eigen::Quaternionf qe, qhat, qcorr;
+    // The propagated state at the scan's time, between the two IMU propagations round it; the newest state when no
+    // propagation is that old yet
+    State at = this->state;
+    for (auto it = this->state_history.begin(); it != this->state_history.end(); ++it) {
+        if (it->stamp > this->scan_stamp) { continue; }
+        at = it->state;
+        if (it != this->state_history.begin()) {
+            const StampedState& next = *(it - 1);
+            const double span = next.stamp - it->stamp;
+            const float f = span > 0. ? static_cast<float>((this->scan_stamp - it->stamp) / span) : 0.f;
+            at.p = it->state.p + f * (next.state.p - it->state.p);
+            at.q = it->state.q.slerp(f, next.state.q);
+        }
+        break;
+    }
+
+    Eigen::Quaternionf qe, qhat, qcorr, delta;
     qhat = this->state.q;
 
-    // Constuct error quaternion
-    qe = qhat.conjugate() * qin;
+    // Constuct error quaternion, at the scan's time
+    qe = at.q.conjugate() * qin;
 
     double sgn = 1.;
     if (qe.w() < 0) { sgn = -1; }
 
-    // Construct quaternion correction
-    qcorr.w() = 1 - abs(qe.w());
-    qcorr.vec() = sgn * qe.vec();
-    qcorr = qhat * qcorr;
+    // Construct quaternion correction, in the body frame, applied to the newest state
+    delta.w() = 1 - abs(qe.w());
+    delta.vec() = sgn * qe.vec();
+    qcorr = qhat * delta;
 
-    Eigen::Vector3f err = pin - this->state.p;
+    Eigen::Vector3f err = pin - at.p;
     Eigen::Vector3f err_body;
 
-    err_body = qhat.conjugate()._transformVector(err);
+    err_body = at.q.conjugate()._transformVector(err);
 
     double abias_max = this->geo_abias_max_;
     double gbias_max = this->geo_gbias_max_;
@@ -1693,6 +1712,16 @@ dlio::OdomNode::updateState() {
     this->state.q.normalize();
 
     if (this->planar_) { this->stateToPlane(); }
+
+    // The same correction on the propagations since the scan, so a scan stamped among them meets corrected states
+    for (StampedState& s : this->state_history) {
+        if (s.stamp <= this->scan_stamp) { break; }
+        s.state.p += dt * this->geo_Kp_ * err;
+        s.state.v.lin.w += dt * this->geo_Kv_ * err;
+        const Eigen::Quaternionf c = s.state.q * delta;
+        s.state.q.coeffs() += static_cast<float>(dt * this->geo_Kq_) * c.coeffs();
+        s.state.q.normalize();
+    }
 
     // store previous pose, orientation, and velocity
     this->geo.prev_p = this->state.p;

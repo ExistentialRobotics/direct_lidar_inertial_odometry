@@ -364,6 +364,15 @@ private:
 
     State state;
 
+    // The propagated states, newest first, each at its IMU measurement's stamp, as many as the IMU buffer holds: the
+    // observer compares a scan's pose with the state at the scan's time, which the newest state leads by the scan's
+    // age (half a sweep and its processing, about 75 ms), so compared with it the state is pulled back while moving.
+    struct StampedState {
+        double stamp;
+        State state;
+    };
+    boost::circular_buffer<StampedState> state_history;
+
     struct Pose {
         Eigen::Vector3f p;     // position in world frame
         Eigen::Quaternionf q;  // orientation in world frame
