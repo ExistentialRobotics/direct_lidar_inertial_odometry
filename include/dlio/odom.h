@@ -23,7 +23,11 @@
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <tf2/buffer_core.h>
+#include <tf2/exceptions.h>
+#include <tf2_msgs/msg/tf_message.hpp>
 #include <tf2_ros/buffer.h>
+#include <tf2_ros/qos.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
 
@@ -191,6 +195,8 @@ private:
 
     // TF
     std::shared_ptr<tf2_ros::TransformBroadcaster> br;
+    rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr tf_static_sub;
+    tf2::BufferCore static_tf;
 
     // ROS Msgs
     nav_msgs::msg::Odometry odom_ros;
@@ -304,7 +310,17 @@ private:
         Eigen::Matrix4f baselink2lidar_T;
     };
 
+    // Each sensor's mount is written once by that sensor's callback, then this flag is set. Read it first elsewhere.
     Extrinsics extrinsics;
+    std::atomic<bool> imu_mount_known{false};
+    std::atomic<bool> lidar_mount_known{false};
+
+    bool
+    readMount(
+        const std::string &frame,
+        Extrinsics::SE3 &mount,
+        Eigen::Matrix4f &mount_T,
+        std::atomic<bool> &known);
 
     // IMU
     rclcpp::Time imu_stamp;

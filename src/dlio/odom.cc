@@ -39,6 +39,14 @@ dlio::OdomNode::OdomNode()
     this->deskew_status = false;
     this->deskew_size = 0;
 
+    // The sensors' mounts, which readMount() takes from here. tf2's QoS, so what is already latched arrives too.
+    this->tf_static_sub = this->create_subscription<tf2_msgs::msg::TFMessage>(
+        "/tf_static",
+        tf2_ros::StaticListenerQoS(),
+        [this](const tf2_msgs::msg::TFMessage &msg) {
+            for (const auto &t: msg.transforms) { this->static_tf.setTransform(t, "tf_static", true); }
+        });
+
     // Subscribers
     this->lidar_cb_group =
         this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -222,6 +230,51 @@ dlio::OdomNode::subscribePointCloud(bool reliable) {
         reliable ? "reliably" : "best effort");
 }
 
+// A sensor's mount in the robot's frame, from base_link to the frame its messages carry, read once from tf_static. Only
+// tf_static is read, so a frame that moves on the robot cannot pass for a mount. False until the mount is known: the
+// sensor's messages are dropped until then, so nothing runs on a mount it has not read.
+bool
+dlio::OdomNode::readMount(
+    const std::string &frame,
+    Extrinsics::SE3 &mount,
+    Eigen::Matrix4f &mount_T,
+    std::atomic<bool> &known) {
+    if (known) { return true; }
+    geometry_msgs::msg::TransformStamped tf;
+    try {
+        tf = this->static_tf.lookupTransform("base_link", frame, tf2::TimePointZero);
+    } catch (const tf2::TransformException &ex) {
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(),
+            *this->get_clock(),
+            2000,
+            "waiting for base_link -> %s on tf_static: %s",
+            frame.c_str(),
+            ex.what());
+        return false;
+    }
+    const auto &t = tf.transform.translation;
+    const auto &q = tf.transform.rotation;
+    mount.t = Eigen::Vector3f(t.x, t.y, t.z);
+    mount.R = Eigen::Quaternionf(q.w, q.x, q.y, q.z).normalized().toRotationMatrix();
+    mount_T = Eigen::Matrix4f::Identity();
+    mount_T.block(0, 3, 3, 1) = mount.t;
+    mount_T.block(0, 0, 3, 3) = mount.R;
+    known = true;  // last: publishPose() reads the mount on another thread once this is set
+    RCLCPP_INFO(
+        this->get_logger(),
+        "mount base_link -> %s from tf_static: t [%.4f, %.4f, %.4f] m, q [%.4f, %.4f, %.4f, %.4f] (x, y, z, w)",
+        frame.c_str(),
+        t.x,
+        t.y,
+        t.z,
+        q.x,
+        q.y,
+        q.z,
+        q.w);
+    return true;
+}
+
 void
 dlio::OdomNode::getParams() {
     // Version
@@ -303,44 +356,6 @@ dlio::OdomNode::getParams() {
 
     // Adaptive Parameters
     dlio::declare_param(this, "adaptive", this->adaptive_params_, true);
-
-    // Extrinsics
-    std::vector<double> t_default{0., 0., 0.};
-    std::vector<double> R_default{1., 0., 0., 0., 1., 0., 0., 0., 1.};
-
-    // center of gravity to imu
-    std::vector<double> baselink2imu_t, baselink2imu_R;
-    dlio::declare_param(this, "extrinsics.baselink2imu.t", baselink2imu_t, t_default);
-    dlio::declare_param(this, "extrinsics.baselink2imu.R", baselink2imu_R, R_default);
-    this->extrinsics.baselink2imu.t =
-        Eigen::Vector3f(baselink2imu_t[0], baselink2imu_t[1], baselink2imu_t[2]);
-    std::vector<float> baselink2imu_R_f(baselink2imu_R.begin(), baselink2imu_R.end());
-    this->extrinsics.baselink2imu.R =
-        Eigen::Map<const Eigen::Matrix<float, -1, -1, Eigen::RowMajor>>(
-            baselink2imu_R_f.data(),
-            3,
-            3);
-    this->extrinsics.baselink2imu_T = Eigen::Matrix4f::Identity();
-    this->extrinsics.baselink2imu_T.block(0, 3, 3, 1) = this->extrinsics.baselink2imu.t;
-    this->extrinsics.baselink2imu_T.block(0, 0, 3, 3) = this->extrinsics.baselink2imu.R;
-
-    // center of gravity to lidar
-    std::vector<double> baselink2lidar_t, baselink2lidar_R;
-    dlio::declare_param(this, "extrinsics.baselink2lidar.t", baselink2lidar_t, t_default);
-    dlio::declare_param(this, "extrinsics.baselink2lidar.R", baselink2lidar_R, R_default);
-
-    this->extrinsics.baselink2lidar.t =
-        Eigen::Vector3f(baselink2lidar_t[0], baselink2lidar_t[1], baselink2lidar_t[2]);
-    std::vector<float> baselink2lidar_R_f(baselink2lidar_R.begin(), baselink2lidar_R.end());
-    this->extrinsics.baselink2lidar.R =
-        Eigen::Map<const Eigen::Matrix<float, -1, -1, Eigen::RowMajor>>(
-            baselink2lidar_R_f.data(),
-            3,
-            3);
-
-    this->extrinsics.baselink2lidar_T = Eigen::Matrix4f::Identity();
-    this->extrinsics.baselink2lidar_T.block(0, 3, 3, 1) = this->extrinsics.baselink2lidar.t;
-    this->extrinsics.baselink2lidar_T.block(0, 0, 3, 3) = this->extrinsics.baselink2lidar.R;
 
     // IMU
     dlio::declare_param(this, "odom.imu.calibration.accel", this->calibrate_accel_, true);
@@ -520,6 +535,8 @@ dlio::OdomNode::publishToROS(
     transformStamped.transform.rotation.z = s.q.z();
 
     br->sendTransform(transformStamped);
+
+    if (!this->imu_mount_known || !this->lidar_mount_known) { return; }
 
     // transform: baselink to imu
     transformStamped.header.stamp = stamp;
@@ -1044,6 +1061,14 @@ dlio::OdomNode::initializeDLIO() {
 
 void
 dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr pc_in) {
+    if (!this->readMount(
+            pc_in->header.frame_id,
+            this->extrinsics.baselink2lidar,
+            this->extrinsics.baselink2lidar_T,
+            this->lidar_mount_known)) {
+        return;
+    }
+
     std::unique_lock<decltype(this->main_loop_running_mutex)> lock(main_loop_running_mutex);
     this->main_loop_running = true;
     lock.unlock();
@@ -1157,6 +1182,14 @@ dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::SharedPt
 
 void
 dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw) {
+    if (!this->readMount(
+            imu_raw->header.frame_id,
+            this->extrinsics.baselink2imu,
+            this->extrinsics.baselink2imu_T,
+            this->imu_mount_known)) {
+        return;
+    }
+
     this->first_imu_received = true;
 
     sensor_msgs::msg::Imu::SharedPtr imu = this->transformImu(imu_raw);
