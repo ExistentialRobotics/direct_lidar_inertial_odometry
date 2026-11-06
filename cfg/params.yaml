@@ -29,6 +29,9 @@
         leafSize: 0.25
 
     odom:
+      initialPose:  # where the base link starts in the odom frame
+        position: [ 0.0, 0.0, 0.0 ]  # m
+        orientation: [ 0.0, 0.0, 0.0, 1.0 ]  # x, y, z, w
       gravity: 9.80665
       computeTimeOffset: true
       odom_frame: dlio/odom

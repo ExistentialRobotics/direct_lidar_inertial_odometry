@@ -92,19 +92,21 @@ dlio::OdomNode::OdomNode()
         std::bind(&dlio::OdomNode::publishPose, this));
 
     this->T = Eigen::Matrix4f::Identity();
-    this->T_prior = Eigen::Matrix4f::Identity();
+    this->T.block(0, 0, 3, 3) = this->initial_orientation_.toRotationMatrix();
+    this->T.block(0, 3, 3, 1) = this->initial_position_;
+    this->T_prior = this->T;
     this->T_corr = Eigen::Matrix4f::Identity();
 
-    this->origin = Eigen::Vector3f(0., 0., 0.);
-    this->state.p = Eigen::Vector3f(0., 0., 0.);
-    this->state.q = Eigen::Quaternionf(1., 0., 0., 0.);
+    this->origin = this->initial_position_;
+    this->state.p = this->initial_position_;
+    this->state.q = this->initial_orientation_;
     this->state.v.lin.b = Eigen::Vector3f(0., 0., 0.);
     this->state.v.lin.w = Eigen::Vector3f(0., 0., 0.);
     this->state.v.ang.b = Eigen::Vector3f(0., 0., 0.);
     this->state.v.ang.w = Eigen::Vector3f(0., 0., 0.);
 
-    this->lidarPose.p = Eigen::Vector3f(0., 0., 0.);
-    this->lidarPose.q = Eigen::Quaternionf(1., 0., 0., 0.);
+    this->lidarPose.p = this->initial_position_;
+    this->lidarPose.q = this->initial_orientation_;
 
     this->imu_meas.stamp = 0.;
     this->imu_meas.ang_vel[0] = 0.;
@@ -325,6 +327,19 @@ dlio::OdomNode::getParams() {
     // Planar: the base link's height, roll and pitch held at the first keyframe's (the plane it stands on there), only
     // x, y and yaw estimated; GICP's pose, the observer's state and each IMU propagation are put back on the plane
     dlio::declare_param(this, "odom.planar", this->planar_, false);
+
+    // Where the base link starts in the odom frame, so robots sharing a frame start at their offsets from each other.
+    // position: [x, y, z] in m. orientation: a quaternion [x, y, z, w], in a frame whose z is up against gravity; with
+    // odom.imu.approximateGravity the IMU gives roll and pitch, and this only the heading.
+    std::vector<double> position, orientation;
+    dlio::declare_param(this, "odom.initialPose.position", position, std::vector<double>{0., 0., 0.});
+    dlio::declare_param(this, "odom.initialPose.orientation", orientation, std::vector<double>{0., 0., 0., 1.});
+    if (position.size() != 3) { throw std::invalid_argument("odom.initialPose.position needs [x, y, z]"); }
+    if (orientation.size() != 4) { throw std::invalid_argument("odom.initialPose.orientation needs [x, y, z, w]"); }
+    Eigen::Quaterniond q(orientation[3], orientation[0], orientation[1], orientation[2]);
+    if (q.norm() < 1e-6) { throw std::invalid_argument("odom.initialPose.orientation is not a rotation"); }
+    this->initial_position_ = Eigen::Vector3d(position.data()).cast<float>();
+    this->initial_orientation_ = q.normalized().cast<float>();
 
     // Gravity
     dlio::declare_param(this, "odom.gravity", this->gravity_, 9.80665);
@@ -1244,7 +1259,8 @@ dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw) {
             gyro_avg /= num_samples;
             accel_avg /= num_samples;
 
-            Eigen::Vector3f grav_vec(0., 0., this->gravity_);
+            // Gravity as the base sees it at the initial attitude
+            Eigen::Vector3f grav_vec = this->state.q.conjugate()._transformVector(Eigen::Vector3f(0., 0., this->gravity_));
 
             if (this->gravity_align_) {
                 // Estimate gravity vector - Only approximate if biases have not been
@@ -1254,8 +1270,10 @@ dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw) {
                     grav_vec,
                     Eigen::Vector3f(0., 0., this->gravity_));
 
-                // set gravity aligned orientation
-                this->state.q = grav_q;
+                // set gravity aligned orientation, at the initial pose's heading
+                Eigen::Matrix3f R0 = this->initial_orientation_.toRotationMatrix();
+                float heading = std::atan2(R0(1, 0), R0(0, 0));
+                this->state.q = Eigen::Quaternionf(Eigen::AngleAxisf(heading, Eigen::Vector3f::UnitZ())) * grav_q;
                 this->T.block(0, 0, 3, 3) = this->state.q.toRotationMatrix();
                 this->lidarPose.q = this->state.q;
 

@@ -460,6 +460,8 @@ private:
     // planar: the base link held to the plane of its first keyframe (that pose's height, roll and pitch), only x, y
     // and yaw estimated
     bool planar_;
+    Eigen::Vector3f initial_position_;  // m, in the odom frame
+    Eigen::Quaternionf initial_orientation_;
     Eigen::Vector3f plane_p_ = Eigen::Vector3f::Zero();
     Eigen::Quaternionf plane_q_ = Eigen::Quaternionf::Identity();
 
