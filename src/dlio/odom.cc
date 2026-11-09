@@ -1761,24 +1761,35 @@ dlio::OdomNode::updateState() {
     double abias_max = this->geo_abias_max_;
     double gbias_max = this->geo_gbias_max_;
 
+    // Each correction is its gain times dt, and at most what the error implies. That is the whole pose error, a
+    // velocity error of err / dt, an accel bias of 2 err / dt^2 and a gyro bias of the angle over dt. After a gap in
+    // the IMU and the lidar, the scan then replaces the propagated state, where gain times dt alone would overshoot it
+    // several times. No cap binds below dt = min(1 / Kp, 1 / Kq), 0.22 s with the default gains, so at the lidar's
+    // rate nothing changes.
+    // shortcut: after a gap the biases take the error as if it were all bias, at most what it implies, and the normal
+    // gains then unlearn it; weigh their gains by how much of the interval the IMU covered if that ever matters.
+    auto gain = [dt](double k, double cap) { return dt > 0. ? std::min(dt * k, cap) : dt * k; };
+    const double kp = gain(this->geo_Kp_, 1.), kq = gain(this->geo_Kq_, 1.), kv = gain(this->geo_Kv_, 1. / dt);
+    const double kab = gain(this->geo_Kab_, 2. / (dt * dt)), kgb = gain(this->geo_Kgb_, 2. / dt);
+
     // Update accel bias
-    this->state.b.accel -= dt * this->geo_Kab_ * err_body;
+    this->state.b.accel -= kab * err_body;
     this->state.b.accel = this->state.b.accel.array().min(abias_max).max(-abias_max);
 
     // Update gyro bias
-    this->state.b.gyro[0] -= dt * this->geo_Kgb_ * qe.w() * qe.x();
-    this->state.b.gyro[1] -= dt * this->geo_Kgb_ * qe.w() * qe.y();
-    this->state.b.gyro[2] -= dt * this->geo_Kgb_ * qe.w() * qe.z();
+    this->state.b.gyro[0] -= kgb * qe.w() * qe.x();
+    this->state.b.gyro[1] -= kgb * qe.w() * qe.y();
+    this->state.b.gyro[2] -= kgb * qe.w() * qe.z();
     this->state.b.gyro = this->state.b.gyro.array().min(gbias_max).max(-gbias_max);
 
     // Update state
-    this->state.p += dt * this->geo_Kp_ * err;
-    this->state.v.lin.w += dt * this->geo_Kv_ * err;
+    this->state.p += kp * err;
+    this->state.v.lin.w += kv * err;
 
-    this->state.q.w() += dt * this->geo_Kq_ * qcorr.w();
-    this->state.q.x() += dt * this->geo_Kq_ * qcorr.x();
-    this->state.q.y() += dt * this->geo_Kq_ * qcorr.y();
-    this->state.q.z() += dt * this->geo_Kq_ * qcorr.z();
+    this->state.q.w() += kq * qcorr.w();
+    this->state.q.x() += kq * qcorr.x();
+    this->state.q.y() += kq * qcorr.y();
+    this->state.q.z() += kq * qcorr.z();
     this->state.q.normalize();
 
     if (this->planar_) { this->stateToPlane(); }
@@ -1786,10 +1797,10 @@ dlio::OdomNode::updateState() {
     // The same correction on the propagations since the scan, so a scan stamped among them meets corrected states
     for (StampedState& s : this->state_history) {
         if (s.stamp <= this->scan_stamp) { break; }
-        s.state.p += dt * this->geo_Kp_ * err;
-        s.state.v.lin.w += dt * this->geo_Kv_ * err;
+        s.state.p += kp * err;
+        s.state.v.lin.w += kv * err;
         const Eigen::Quaternionf c = s.state.q * delta;
-        s.state.q.coeffs() += static_cast<float>(dt * this->geo_Kq_) * c.coeffs();
+        s.state.q.coeffs() += static_cast<float>(kq) * c.coeffs();
         s.state.q.normalize();
     }
 
