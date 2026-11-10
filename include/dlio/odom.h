@@ -328,6 +328,14 @@ private:
     rclcpp::Time state_stamp;
     double first_imu_stamp;
     double prev_imu_stamp;
+    // The IMU's sample period in s, the median of its first 100 intervals; <= 0: not known yet. An interval longer than
+    // 1.5 periods is a gap, where at least one sample is missing. Only the IMU callback uses them.
+    double imu_period_ = 0.;
+    std::vector<double> imu_first_dts_;
+    bool imuGap(double dt) const {
+        const double T = this->imu_period_;
+        return T > 0. && dt > 1.5 * T;
+    }
     double imu_dp, imu_dq_deg;
 
     struct ImuMeas {

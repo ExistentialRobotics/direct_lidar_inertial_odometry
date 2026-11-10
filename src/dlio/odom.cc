@@ -1322,6 +1322,14 @@ dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw) {
         double dt = imu_stamp_secs - this->prev_imu_stamp;
         this->imu_rates.push_back(1. / dt);
         if (dt == 0) { return; }
+        if (this->imu_period_ <= 0. && dt > 0.) {
+            this->imu_first_dts_.push_back(dt);
+            if (this->imu_first_dts_.size() == 100) {
+                std::nth_element(this->imu_first_dts_.begin(), this->imu_first_dts_.begin() + 50,
+                                 this->imu_first_dts_.end());
+                this->imu_period_ = this->imu_first_dts_[50];
+            }
+        }
 
         // Apply the calibrated bias to the new IMU measurements
         this->imu_meas.stamp = imu_stamp_secs;
@@ -1680,6 +1688,32 @@ dlio::OdomNode::propagateState() {
 
     Eigen::Quaternionf qhat = this->state.q, omega;
     Eigen::Vector3f world_accel;
+
+    // Across a gap in the IMU the velocity carries on, the rotation takes the rate between the samples on each side
+    // through exactly, and the new sample's acceleration acts for one period, in the orientation it was measured in.
+    // One sample's acceleration over a whole gap moves the pose metres, since a skid-steer robot's vibration reads
+    // several m/s^2. After the observer's correction the velocity is then the gap's average. The scan's deskew and
+    // prediction (integrateImuInternal) keep the model between samples, since indoors the accelerations across a gap
+    // are real: a robot speeding up through one would be predicted short.
+    if (this->imuGap(dt)) {
+        const double T = this->imu_period_;
+        const Eigen::Vector3f w = 0.5f * (this->state.v.ang.b + this->imu_meas.ang_vel);
+        const float angle = w.norm() * static_cast<float>(dt);
+        Eigen::Quaternionf q = qhat;
+        if (angle > 0.f) { q = (qhat * Eigen::Quaternionf(Eigen::AngleAxisf(angle, w / w.norm()))).normalized(); }
+        Eigen::Vector3f a = q._transformVector(this->imu_meas.lin_accel);
+        a[2] -= this->gravity_;
+        this->state.p += this->state.v.lin.w * dt + 0.5 * T * T * a;
+        this->state.v.lin.w += a * T;
+        this->state.v.lin.b = q.toRotationMatrix().inverse() * this->state.v.lin.w;
+        this->state.q = q;
+        this->state.v.ang.b = this->imu_meas.ang_vel;
+        this->state.v.ang.w = this->state.q.toRotationMatrix() * this->state.v.ang.b;
+        if (this->planar_) { this->stateToPlane(); }
+        this->state_stamp = this->imu_stamp;
+        this->state_history.push_front({this->imu_meas.stamp, this->state});
+        return;
+    }
 
     // Transform accel from body to world frame
     world_accel = qhat._transformVector(this->imu_meas.lin_accel);
