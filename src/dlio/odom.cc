@@ -1408,11 +1408,14 @@ dlio::OdomNode::imuMeasFromTimeRange(
     boost::circular_buffer<ImuMeas>::reverse_iterator &begin_imu_it,
     boost::circular_buffer<ImuMeas>::reverse_iterator &end_imu_it) {
     if (this->imu_buffer.empty() || this->imu_buffer.front().stamp < end_time) {
-        // Wait for the latest IMU data
+        // Wait for the latest IMU data, in steps, so that a shutdown, after which no IMU message comes, ends the wait
+        // and the node can exit rather than wait for the launch's SIGKILL.
         std::unique_lock<decltype(this->mtx_imu)> lock(this->mtx_imu);
-        this->cv_imu_stamp.wait(lock, [this, &end_time] {
-            return this->imu_buffer.front().stamp >= end_time;
-        });
+        while (!this->cv_imu_stamp.wait_for(lock, std::chrono::milliseconds(100), [this, &end_time] {
+            return !this->imu_buffer.empty() && this->imu_buffer.front().stamp >= end_time;
+        })) {
+            if (!rclcpp::ok()) return false;
+        }
     }
 
     auto imu_it = this->imu_buffer.begin();
